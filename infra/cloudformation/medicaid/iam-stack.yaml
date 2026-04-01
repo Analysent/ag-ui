@@ -1,0 +1,739 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Medicaid Platform IAM Stack - Roles, policies, permissions boundaries, and
+  FedRAMP-compliant IAM account password policy for the Medicaid application.
+  Implements principle of least privilege per NIST 800-53 AC-6.
+  Version: 1.0.0
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Environment
+        Parameters:
+          - Environment
+          - ApplicationName
+          - CostCenter
+          - Owner
+      - Label:
+          default: Cross-Account References
+        Parameters:
+          - AuditAccountId
+          - SecurityAccountId
+      - Label:
+          default: Service Configuration
+        Parameters:
+          - ECSTaskImageUri
+          - LambdaFunctionPrefix
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+
+  ApplicationName:
+    Type: String
+    Default: medicaid-platform
+
+  CostCenter:
+    Type: String
+
+  Owner:
+    Type: String
+
+  AuditAccountId:
+    Type: String
+    Description: AWS Account ID for centralized audit/logging
+    AllowedPattern: '\d{12}'
+
+  SecurityAccountId:
+    Type: String
+    Description: AWS Account ID for security tooling
+    AllowedPattern: '\d{12}'
+
+  ECSTaskImageUri:
+    Type: String
+    Description: ECR repository URI for ECS task images
+    Default: ''
+
+  LambdaFunctionPrefix:
+    Type: String
+    Default: medicaid
+    Description: Prefix for Lambda function names this role can access
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  # ============================================================
+  # FEDRAMP-COMPLIANT IAM ACCOUNT PASSWORD POLICY
+  # NIST 800-53 IA-5(1): Authenticator Management
+  # ============================================================
+  IAMPasswordPolicy:
+    Type: AWS::IAM::AccountPasswordPolicy
+    Properties:
+      MinimumPasswordLength: 16
+      RequireUppercaseCharacters: true
+      RequireLowercaseCharacters: true
+      RequireNumbers: true
+      RequireSymbols: true
+      MaxPasswordAge: 60
+      PasswordReusePrevention: 24
+      AllowUsersToChangePassword: true
+      HardExpiry: false
+
+  # ============================================================
+  # PERMISSIONS BOUNDARY POLICY
+  # Applied to all application roles to limit blast radius
+  # ============================================================
+  ApplicationPermissionsBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ApplicationName}-${Environment}-permissions-boundary'
+      Description: >
+        Permissions boundary for all Medicaid application roles.
+        Prevents privilege escalation and limits scope of access.
+        FedRAMP Control: AC-6, AC-2
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCoreServices
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - sqs:SendMessage
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sns:Publish
+              - secretsmanager:GetSecretValue
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:ResourceTag/Application: !Ref ApplicationName
+          - Sid: DenyPrivilegeEscalation
+            Effect: Deny
+            Action:
+              - iam:CreateUser
+              - iam:DeleteUser
+              - iam:AttachUserPolicy
+              - iam:DetachUserPolicy
+              - iam:PutUserPolicy
+              - iam:CreateAccessKey
+              - iam:CreateLoginProfile
+              - iam:UpdateLoginProfile
+              - iam:PassRole
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:PutRolePolicy
+              - iam:UpdateAssumeRolePolicy
+              - iam:SetDefaultPolicyVersion
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicyVersion
+              - sts:AssumeRole
+            Resource: '*'
+            Condition:
+              ArnNotLike:
+                aws:PrincipalArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ApplicationName}-${Environment}-cfn-service-role'
+          - Sid: DenyLeaveOrganization
+            Effect: Deny
+            Action:
+              - organizations:LeaveOrganization
+            Resource: '*'
+          - Sid: DenyDisableSecurityServices
+            Effect: Deny
+            Action:
+              - cloudtrail:StopLogging
+              - cloudtrail:DeleteTrail
+              - guardduty:DeleteDetector
+              - securityhub:DisableSecurityHub
+              - config:DeleteConfigRule
+              - config:StopConfigurationRecorder
+            Resource: '*'
+
+  # ============================================================
+  # ECS TASK EXECUTION ROLE
+  # Used by ECS agent to pull images and write logs
+  # ============================================================
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-ecs-execution-role'
+      Description: ECS Task Execution Role - allows ECS to pull images and write logs
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      PermissionsBoundary: !Ref ApplicationPermissionsBoundary
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ApplicationName}/${Environment}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: DataClassification
+          Value: PHI-Restricted
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  # ============================================================
+  # ECS TASK ROLE
+  # Used by the application code running in ECS tasks
+  # ============================================================
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-ecs-task-role'
+      Description: ECS Task Role - application runtime permissions for Medicaid services
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      PermissionsBoundary: !Ref ApplicationPermissionsBoundary
+      Policies:
+        - PolicyName: S3DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowReadWriteDataBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ApplicationName}-${Environment}-data-*'
+                  - !Sub 'arn:aws:s3:::${ApplicationName}-${Environment}-data-*/*'
+              - Sid: DenyUnencryptedObjectUploads
+                Effect: Deny
+                Action: s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ApplicationName}-${Environment}-data-*/*'
+                Condition:
+                  StringNotEquals:
+                    s3:x-amz-server-side-encryption: aws:kms
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:DescribeTable
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ApplicationName}-${Environment}-*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ApplicationName}-${Environment}-*/index/*'
+        - PolicyName: SQSSNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ChangeMessageVisibility
+                Resource:
+                  - !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ApplicationName}-${Environment}-*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationName}-${Environment}-*'
+        - PolicyName: SecretsAndKMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ApplicationName}/${Environment}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:CallerAccount: !Ref AWS::AccountId
+                  StringLike:
+                    kms:ViaService:
+                      - !Sub 's3.${AWS::Region}.amazonaws.com'
+                      - !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+                      - !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+                      - !Sub 'sqs.${AWS::Region}.amazonaws.com'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ApplicationName}/${Environment}/*'
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: DataClassification
+          Value: PHI-Restricted
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  # ============================================================
+  # LAMBDA EXECUTION ROLE
+  # ============================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-lambda-execution-role'
+      Description: Lambda execution role for Medicaid serverless functions
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      PermissionsBoundary: !Ref ApplicationPermissionsBoundary
+      Policies:
+        - PolicyName: LambdaBasePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionPrefix}*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ApplicationName}/${Environment}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:CallerAccount: !Ref AWS::AccountId
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ApplicationName}-${Environment}-*'
+                  - !Sub 'arn:aws:s3:::${ApplicationName}-${Environment}-*/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ApplicationName}-${Environment}-*'
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: DataClassification
+          Value: PHI-Restricted
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  # ============================================================
+  # AWS BATCH JOB ROLE
+  # For batch processing of Medicaid claims data
+  # ============================================================
+  BatchJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-batch-job-role'
+      Description: AWS Batch job role for Medicaid claims batch processing
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      PermissionsBoundary: !Ref ApplicationPermissionsBoundary
+      Policies:
+        - PolicyName: BatchJobPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ApplicationName}-${Environment}-batch-*'
+                  - !Sub 'arn:aws:s3:::${ApplicationName}-${Environment}-batch-*/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/batch/${ApplicationName}*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ApplicationName}/${Environment}/batch/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ApplicationName}-${Environment}-batch-notifications'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ============================================================
+  # CLOUDFORMATION SERVICE ROLE
+  # Used by CloudFormation to create/update/delete stack resources
+  # ============================================================
+  CloudFormationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-cfn-service-role'
+      Description: >
+        CloudFormation service role for deploying Medicaid platform infrastructure.
+        This role is assumed by CloudFormation during stack operations.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: CloudFormationDeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowInfrastructureManagement
+                Effect: Allow
+                Action:
+                  - ec2:*
+                  - ecs:*
+                  - rds:*
+                  - elasticache:*
+                  - elasticloadbalancing:*
+                  - autoscaling:*
+                  - application-autoscaling:*
+                  - s3:*
+                  - dynamodb:*
+                  - sqs:*
+                  - sns:*
+                  - kms:*
+                  - logs:*
+                  - cloudwatch:*
+                  - events:*
+                  - lambda:*
+                  - secretsmanager:*
+                  - acm:*
+                  - route53:*
+                  - wafv2:*
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - us-east-1
+                      - us-west-2
+              - Sid: AllowIAMRoleManagement
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ApplicationName}-*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:instance-profile/${ApplicationName}-*'
+              - Sid: AllowManagedPolicyManagement
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:SetDefaultPolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:TagPolicy
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/${ApplicationName}-*'
+              - Sid: AllowCloudFormationOperations
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:*:${AWS::AccountId}:stack/${ApplicationName}-*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: DataClassification
+          Value: PHI-Restricted
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  # ============================================================
+  # CROSS-ACCOUNT AUDIT ROLE
+  # Allows audit account to read logs and findings
+  # ============================================================
+  CrossAccountAuditRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-audit-cross-account-role'
+      Description: Allows centralized audit account read-only access for compliance
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AuditAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              Bool:
+                aws:MultiFactorAuthPresent: 'true'
+              StringEquals:
+                sts:ExternalId: !Sub '${ApplicationName}-audit-${Environment}'
+      Policies:
+        - PolicyName: AuditReadOnlyPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudtrail:GetTrail
+                  - cloudtrail:GetTrailStatus
+                  - cloudtrail:LookupEvents
+                  - cloudtrail:DescribeTrails
+                  - config:GetComplianceDetailsByConfigRule
+                  - config:GetComplianceSummaryByConfigRule
+                  - config:DescribeConfigRules
+                  - config:DescribeComplianceByConfigRule
+                  - guardduty:GetFindings
+                  - guardduty:ListFindings
+                  - guardduty:GetDetector
+                  - securityhub:GetFindings
+                  - securityhub:DescribeHub
+                  - securityhub:GetInsights
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ============================================================
+  # AUTO SCALING ROLE FOR ECS
+  # ============================================================
+  ECSAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-ecs-autoscaling-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+Outputs:
+  ECSTaskExecutionRoleArn:
+    Description: ARN of the ECS Task Execution Role
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSTaskExecutionRoleArn'
+
+  ECSTaskRoleArn:
+    Description: ARN of the ECS Task Role
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSTaskRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda Execution Role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  BatchJobRoleArn:
+    Description: ARN of the AWS Batch Job Role
+    Value: !GetAtt BatchJobRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BatchJobRoleArn'
+
+  CloudFormationServiceRoleArn:
+    Description: ARN of the CloudFormation Service Role
+    Value: !GetAtt CloudFormationServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFormationServiceRoleArn'
+
+  ApplicationPermissionsBoundaryArn:
+    Description: ARN of the Permissions Boundary Policy
+    Value: !Ref ApplicationPermissionsBoundary
+    Export:
+      Name: !Sub '${AWS::StackName}-PermissionsBoundaryArn'
+
+  ECSAutoScalingRoleArn:
+    Description: ARN of the ECS Auto Scaling Role
+    Value: !GetAtt ECSAutoScalingRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSAutoScalingRoleArn'

@@ -1,0 +1,968 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Medicaid Platform Security Stack - CloudTrail, AWS Config, Security Hub, GuardDuty,
+  KMS, S3 audit bucket, CIS Level 2 Config Rules, and SNS alerting.
+  Implements FedRAMP Moderate and HIPAA security controls.
+  NIST 800-53 Controls: AU-2, AU-3, AU-9, AU-12, SI-4, CA-7, RA-5
+  Version: 1.0.0
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+
+  ApplicationName:
+    Type: String
+    Default: medicaid-platform
+
+  CostCenter:
+    Type: String
+
+  Owner:
+    Type: String
+
+  AlertEmailAddress:
+    Type: String
+    Description: Email address for security alerts
+    AllowedPattern: '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+
+  SecurityAlertPhoneNumber:
+    Type: String
+    Description: Phone number for critical security SMS alerts (E.164 format)
+    Default: ''
+
+  AuditLogRetentionDays:
+    Type: Number
+    Default: 2557
+    Description: Audit log retention (2557 days = ~7 years, required for HIPAA/CMS)
+
+  EnableGuardDutyThreatIntelligence:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  CentralizedLoggingAccountId:
+    Type: String
+    Description: Account ID for centralized logging (can be same account)
+    AllowedPattern: '\d{12}'
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  HasPhoneNumber: !Not [!Equals [!Ref SecurityAlertPhoneNumber, '']]
+
+Resources:
+  # ============================================================
+  # KMS KEY FOR AUDIT AND SECURITY SERVICES
+  # ============================================================
+  SecurityKMSKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub 'KMS key for ${ApplicationName} ${Environment} security services (CloudTrail, Config, SecurityHub)'
+      EnableKeyRotation: true
+      KeyUsage: ENCRYPT_DECRYPT
+      KeySpec: SYMMETRIC_DEFAULT
+      MultiRegion: false
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowCloudTrailEncryption
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringLike:
+                kms:EncryptionContext:aws:cloudtrail:arn:
+                  - !Sub 'arn:aws:cloudtrail:*:${AWS::AccountId}:trail/*'
+          - Sid: AllowConfigEncryption
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+          - Sid: AllowCloudWatchLogsEncryption
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+          - Sid: AllowSNSEncryption
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-security-kms-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: DataClassification
+          Value: Security-Sensitive
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  SecurityKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ApplicationName}-${Environment}-security'
+      TargetKeyId: !Ref SecurityKMSKey
+
+  # ============================================================
+  # S3 AUDIT BUCKET
+  # ============================================================
+  AuditLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ApplicationName}-${Environment}-audit-logs-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SecurityKMSKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: COMPLIANCE
+            Days: !Ref AuditLogRetentionDays
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 365
+                StorageClass: GLACIER
+              - TransitionInDays: 2190
+                StorageClass: DEEP_ARCHIVE
+      LoggingConfiguration:
+        DestinationBucketName: !Sub '${ApplicationName}-${Environment}-audit-logs-${AWS::AccountId}-${AWS::Region}'
+        LogFilePrefix: 'bucket-access-logs/'
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'cloudtrail/'
+            Topic: !Ref SecurityAlertsTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-audit-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: DataClassification
+          Value: Audit-Logs-Restricted
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Compliance
+          Value: HIPAA-FedRAMP-HITECH
+
+  AuditLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyHTTPAccess
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AuditLogsBucket.Arn
+              - !Sub '${AuditLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: AllowCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AuditLogsBucket.Arn}/cloudtrail/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ApplicationName}-${Environment}-trail'
+          - Sid: AllowCloudTrailBucketCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AuditLogsBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ApplicationName}-${Environment}-trail'
+          - Sid: AllowConfigWrite
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:GetBucketAcl
+            Resource:
+              - !GetAtt AuditLogsBucket.Arn
+              - !Sub '${AuditLogsBucket.Arn}/config/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyDeleteWithoutMFA
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:DeleteBucket
+            Resource:
+              - !GetAtt AuditLogsBucket.Arn
+              - !Sub '${AuditLogsBucket.Arn}/*'
+            Condition:
+              BoolIfExists:
+                aws:MultiFactorAuthPresent: 'false'
+
+  # ============================================================
+  # SNS TOPICS FOR ALERTS
+  # ============================================================
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-security-alerts'
+      DisplayName: !Sub 'Medicaid ${Environment} Security Alerts'
+      KmsMasterKeyId: !Ref SecurityKMSKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  SecurityAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SecurityAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailAddress
+
+  SecurityAlertsSMSSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasPhoneNumber
+    Properties:
+      TopicArn: !Ref SecurityAlertsTopic
+      Protocol: sms
+      Endpoint: !Ref SecurityAlertPhoneNumber
+
+  CriticalFindingsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-critical-findings'
+      DisplayName: !Sub 'Medicaid ${Environment} Critical Security Findings'
+      KmsMasterKeyId: !Ref SecurityKMSKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ============================================================
+  # CLOUDTRAIL
+  # ============================================================
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/cloudtrail/${ApplicationName}-${Environment}'
+      RetentionInDays: 365
+      KmsKeyId: !GetAtt SecurityKMSKey.Arn
+
+  CloudTrailLogGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-cloudtrail-cw-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: CloudTrailCloudWatchPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: AuditLogsBucketPolicy
+    DeletionPolicy: Retain
+    Properties:
+      TrailName: !Sub '${ApplicationName}-${Environment}-trail'
+      IsLogging: true
+      S3BucketName: !Ref AuditLogsBucket
+      S3KeyPrefix: cloudtrail
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogGroupRole.Arn
+      KMSKeyId: !Ref SecurityKMSKey
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - 'arn:aws:s3:::'
+            - Type: AWS::Lambda::Function
+              Values:
+                - 'arn:aws:lambda'
+      InsightSelectors:
+        - InsightType: ApiCallRateInsight
+        - InsightType: ApiErrorRateInsight
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-trail'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: DataClassification
+          Value: Audit-Logs-Restricted
+        - Key: Compliance
+          Value: HIPAA-FedRAMP-HITECH
+
+  # ============================================================
+  # AWS CONFIG
+  # ============================================================
+  ConfigRecorderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-config-recorder-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+      Policies:
+        - PolicyName: ConfigS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                Resource:
+                  - !GetAtt AuditLogsBucket.Arn
+                  - !Sub '${AuditLogsBucket.Arn}/*'
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-config-recorder'
+      RoleARN: !GetAtt ConfigRecorderRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+        RecordingStrategy:
+          UseOnly: ALL_SUPPORTED_RESOURCE_TYPES
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn: AuditLogsBucketPolicy
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-config-delivery'
+      S3BucketName: !Ref AuditLogsBucket
+      S3KeyPrefix: config
+      S3KmsKeyArn: !GetAtt SecurityKMSKey.Arn
+      SnsTopicARN: !Ref SecurityAlertsTopic
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  # ============================================================
+  # AWS CONFIG RULES - CIS Level 2 Benchmarks
+  # ============================================================
+  ConfigRuleRootAccountMFAEnabled:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-root-mfa-enabled'
+      Description: 'CIS 1.13 - Ensure MFA is enabled for the root account'
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCOUNT_MFA_ENABLED
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  ConfigRuleIAMPasswordPolicy:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-iam-password-policy'
+      Description: 'CIS 1.5-1.11 - IAM password policy requirements'
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_PASSWORD_POLICY
+      InputParameters:
+        RequireUppercaseCharacters: 'true'
+        RequireLowercaseCharacters: 'true'
+        RequireSymbols: 'true'
+        RequireNumbers: 'true'
+        MinimumPasswordLength: '16'
+        PasswordReusePrevention: '24'
+        MaxPasswordAge: '60'
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  ConfigRuleCloudTrailEnabled:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-cloudtrail-enabled'
+      Description: 'CIS 2.1 - Ensure CloudTrail is enabled in all regions'
+      Source:
+        Owner: AWS
+        SourceIdentifier: MULTI_REGION_CLOUD_TRAIL_ENABLED
+      InputParameters:
+        readWriteType: ALL
+        includeManagementEvents: 'true'
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  ConfigRuleCloudTrailEncryption:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-cloudtrail-encryption'
+      Description: 'CIS 2.7 - Ensure CloudTrail logs encrypted at rest using KMS'
+      Source:
+        Owner: AWS
+        SourceIdentifier: CLOUD_TRAIL_ENCRYPTION_ENABLED
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  ConfigRuleCloudTrailLogValidation:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-cloudtrail-log-validation'
+      Description: 'CIS 2.2 - Ensure CloudTrail log file validation is enabled'
+      Source:
+        Owner: AWS
+        SourceIdentifier: CLOUD_TRAIL_LOG_FILE_VALIDATION_ENABLED
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  ConfigRuleS3PublicReadProhibited:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-s3-no-public-read'
+      Description: 'CIS 2.3 - Prohibit public read access on S3 buckets'
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+
+  ConfigRuleS3PublicWriteProhibited:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-s3-no-public-write'
+      Description: 'Prohibit public write access on S3 buckets'
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_WRITE_PROHIBITED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+
+  ConfigRuleS3BucketSSLOnly:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-s3-ssl-only'
+      Description: 'Ensure S3 buckets only allow SSL/TLS requests'
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_SSL_REQUESTS_ONLY
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+
+  ConfigRuleS3BucketEncrypted:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-s3-encrypted'
+      Description: 'Ensure S3 buckets have server-side encryption enabled'
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+
+  ConfigRuleRDSEncryptionEnabled:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-rds-encryption-enabled'
+      Description: 'CIS - Ensure RDS instances are encrypted at rest'
+      Source:
+        Owner: AWS
+        SourceIdentifier: RDS_STORAGE_ENCRYPTED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::RDS::DBInstance
+
+  ConfigRuleRDSMultiAZ:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-rds-multi-az'
+      Description: 'Ensure production RDS instances have Multi-AZ enabled'
+      Source:
+        Owner: AWS
+        SourceIdentifier: RDS_MULTI_AZ_SUPPORT
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::RDS::DBInstance
+
+  ConfigRuleVPCFlowLogsEnabled:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-vpc-flow-logs-enabled'
+      Description: 'CIS 2.9 - Ensure VPC flow logging is enabled'
+      Source:
+        Owner: AWS
+        SourceIdentifier: VPC_FLOW_LOGS_ENABLED
+      InputParameters:
+        trafficType: ALL
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::VPC
+
+  ConfigRuleEBSEncryptionByDefault:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-ebs-encryption-default'
+      Description: 'Ensure EBS volumes created are encrypted by default'
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_EBS_ENCRYPTION_BY_DEFAULT
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  ConfigRuleKMSKeyRotation:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-kms-key-rotation'
+      Description: 'CIS 2.8 - Ensure KMS CMK rotation is enabled'
+      Source:
+        Owner: AWS
+        SourceIdentifier: CMK_BACKING_KEY_ROTATION_ENABLED
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  ConfigRuleSecurityGroupNoSSH:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-no-unrestricted-ssh'
+      Description: 'CIS 4.1 - Ensure no security groups allow unrestricted SSH'
+      Source:
+        Owner: AWS
+        SourceIdentifier: INCOMING_SSH_DISABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+
+  ConfigRuleSecurityGroupNoRDP:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-no-unrestricted-rdp'
+      Description: 'CIS 4.2 - Ensure no security groups allow unrestricted RDP'
+      Source:
+        Owner: AWS
+        SourceIdentifier: RESTRICTED_INCOMING_TRAFFIC
+      InputParameters:
+        blockedPort1: '3389'
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+
+  ConfigRuleIAMNoRootAccessKey:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-no-root-access-key'
+      Description: 'CIS 1.12 - Ensure no root account access key exists'
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_ROOT_ACCESS_KEY_CHECK
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  ConfigRuleRequiredTags:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ApplicationName}-${Environment}-required-tags'
+      Description: 'Ensure all resources have required compliance tags'
+      Source:
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+      InputParameters:
+        tag1Key: Environment
+        tag2Key: Application
+        tag3Key: DataClassification
+        tag4Key: CostCenter
+        tag5Key: Owner
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+          - AWS::S3::Bucket
+          - AWS::RDS::DBInstance
+          - AWS::ElastiCache::CacheCluster
+
+  # ============================================================
+  # AWS SECURITY HUB
+  # ============================================================
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Properties:
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref ApplicationName
+        DataClassification: Security-Sensitive
+        CostCenter: !Ref CostCenter
+        Owner: !Ref Owner
+
+  # ============================================================
+  # AMAZON GUARDDUTY
+  # ============================================================
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      DataSources:
+        S3Logs:
+          Enable: true
+        Kubernetes:
+          AuditLogs:
+            Enable: true
+        MalwareProtection:
+          ScanEc2InstanceWithFindings:
+            EbsVolumes: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ============================================================
+  # CLOUDWATCH ALARMS FOR CRITICAL CLOUDTRAIL EVENTS
+  # CIS Benchmark Metric Filters and Alarms
+  # ============================================================
+
+  # CIS 3.1 - Unauthorized API calls
+  UnauthorizedApiCallsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: >-
+        {($.errorCode = "AccessDenied") || ($.errorCode = "UnauthorizedAccess") ||
+        ($.errorCode = "*UnauthorizedAccess*") || ($.errorCode = "*AccessDenied*")}
+      MetricTransformations:
+        - MetricNamespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+          MetricName: UnauthorizedApiCalls
+          MetricValue: '1'
+          DefaultValue: 0
+
+  UnauthorizedApiCallsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-unauthorized-api-calls'
+      AlarmDescription: 'CIS 3.1 - Unauthorized API calls detected'
+      MetricName: UnauthorizedApiCalls
+      Namespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      OKActions:
+        - !Ref SecurityAlertsTopic
+
+  # CIS 3.3 - Root account usage
+  RootAccountUsageFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: >-
+        {$.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS &&
+        $.eventType != "AwsServiceEvent"}
+      MetricTransformations:
+        - MetricNamespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+          MetricName: RootAccountUsage
+          MetricValue: '1'
+          DefaultValue: 0
+
+  RootAccountUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-root-account-usage'
+      AlarmDescription: 'CIS 3.3 - Root account usage detected'
+      MetricName: RootAccountUsage
+      Namespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref CriticalFindingsTopic
+
+  # CIS 3.4 - IAM policy changes
+  IAMPolicyChangesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: >-
+        {($.eventName=DeleteGroupPolicy) || ($.eventName=DeleteRolePolicy) ||
+        ($.eventName=DeleteUserPolicy) || ($.eventName=PutGroupPolicy) ||
+        ($.eventName=PutRolePolicy) || ($.eventName=PutUserPolicy) ||
+        ($.eventName=CreatePolicy) || ($.eventName=DeletePolicy) ||
+        ($.eventName=CreatePolicyVersion) || ($.eventName=DeletePolicyVersion) ||
+        ($.eventName=SetDefaultPolicyVersion) || ($.eventName=AttachRolePolicy) ||
+        ($.eventName=DetachRolePolicy) || ($.eventName=AttachUserPolicy) ||
+        ($.eventName=DetachUserPolicy) || ($.eventName=AttachGroupPolicy) ||
+        ($.eventName=DetachGroupPolicy)}
+      MetricTransformations:
+        - MetricNamespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+          MetricName: IAMPolicyChanges
+          MetricValue: '1'
+          DefaultValue: 0
+
+  IAMPolicyChangesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-iam-policy-changes'
+      AlarmDescription: 'CIS 3.4 - IAM policy changes detected'
+      MetricName: IAMPolicyChanges
+      Namespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+
+  # CIS 3.5 - CloudTrail configuration changes
+  CloudTrailChangesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: >-
+        {($.eventName=CreateTrail) || ($.eventName=UpdateTrail) ||
+        ($.eventName=DeleteTrail) || ($.eventName=StartLogging) ||
+        ($.eventName=StopLogging)}
+      MetricTransformations:
+        - MetricNamespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+          MetricName: CloudTrailChanges
+          MetricValue: '1'
+          DefaultValue: 0
+
+  CloudTrailChangesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-cloudtrail-changes'
+      AlarmDescription: 'CIS 3.5 - CloudTrail configuration changes detected'
+      MetricName: CloudTrailChanges
+      Namespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref CriticalFindingsTopic
+
+  # CIS 3.8 - S3 Bucket policy changes
+  S3BucketPolicyChangesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: >-
+        {($.eventSource=s3.amazonaws.com) && (($.eventName=PutBucketAcl) ||
+        ($.eventName=PutBucketPolicy) || ($.eventName=PutBucketCors) ||
+        ($.eventName=PutBucketLifecycle) || ($.eventName=PutBucketReplication) ||
+        ($.eventName=DeleteBucketPolicy) || ($.eventName=DeleteBucketCors) ||
+        ($.eventName=DeleteBucketLifecycle) || ($.eventName=DeleteBucketReplication))}
+      MetricTransformations:
+        - MetricNamespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+          MetricName: S3BucketPolicyChanges
+          MetricValue: '1'
+          DefaultValue: 0
+
+  S3BucketPolicyChangesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-s3-bucket-policy-changes'
+      AlarmDescription: 'CIS 3.8 - S3 bucket policy changes detected'
+      MetricName: S3BucketPolicyChanges
+      Namespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+
+  # CIS 3.12 - Network gateway changes
+  NetworkGatewayChangesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: >-
+        {($.eventName=CreateCustomerGateway) || ($.eventName=DeleteCustomerGateway) ||
+        ($.eventName=AttachInternetGateway) || ($.eventName=CreateInternetGateway) ||
+        ($.eventName=DeleteInternetGateway) || ($.eventName=DetachInternetGateway)}
+      MetricTransformations:
+        - MetricNamespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+          MetricName: NetworkGatewayChanges
+          MetricValue: '1'
+          DefaultValue: 0
+
+  NetworkGatewayChangesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-network-gateway-changes'
+      AlarmDescription: 'CIS 3.12 - Network gateway changes detected'
+      MetricName: NetworkGatewayChanges
+      Namespace: !Sub 'CISBenchmarks/${ApplicationName}/${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+
+Outputs:
+  SecurityKMSKeyId:
+    Description: Security KMS Key ID
+    Value: !Ref SecurityKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityKMSKeyId'
+
+  SecurityKMSKeyArn:
+    Description: Security KMS Key ARN
+    Value: !GetAtt SecurityKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityKMSKeyArn'
+
+  AuditLogsBucketName:
+    Description: Audit Logs S3 Bucket Name
+    Value: !Ref AuditLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AuditLogsBucketName'
+
+  AuditLogsBucketArn:
+    Description: Audit Logs S3 Bucket ARN
+    Value: !GetAtt AuditLogsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AuditLogsBucketArn'
+
+  SecurityAlertsTopicArn:
+    Description: Security Alerts SNS Topic ARN
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlertsTopicArn'
+
+  CriticalFindingsTopicArn:
+    Description: Critical Findings SNS Topic ARN
+    Value: !Ref CriticalFindingsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CriticalFindingsTopicArn'
+
+  GuardDutyDetectorId:
+    Description: GuardDuty Detector ID
+    Value: !Ref GuardDutyDetector
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardDutyDetectorId'
+
+  CloudTrailArn:
+    Description: CloudTrail ARN
+    Value: !GetAtt CloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'

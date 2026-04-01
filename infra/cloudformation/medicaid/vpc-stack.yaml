@@ -1,0 +1,930 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Medicaid Platform VPC Stack - Multi-AZ VPC with public/private subnets,
+  NAT Gateways, VPC Flow Logs, and HIPAA/FedRAMP-compliant network segmentation.
+  Version: 1.0.0
+
+# ============================================================
+# STACK POLICY (applied via AWS CLI after stack creation)
+# aws cloudformation set-stack-policy --stack-name medicaid-vpc-prod \
+#   --stack-policy-body file://stack-policy.json
+# ============================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Environment Configuration
+        Parameters:
+          - Environment
+          - ApplicationName
+          - CostCenter
+          - Owner
+      - Label:
+          default: VPC Network Configuration
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PublicSubnet3Cidr
+          - PrivateAppSubnet1Cidr
+          - PrivateAppSubnet2Cidr
+          - PrivateAppSubnet3Cidr
+          - PrivateDataSubnet1Cidr
+          - PrivateDataSubnet2Cidr
+          - PrivateDataSubnet3Cidr
+      - Label:
+          default: Flow Logs Configuration
+        Parameters:
+          - FlowLogsRetentionDays
+          - EnableFlowLogs
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+    ConstraintDescription: Must be dev, staging, or prod
+
+  ApplicationName:
+    Type: String
+    Default: medicaid-platform
+    Description: Application name used for resource naming and tagging
+    AllowedPattern: '[a-z0-9\-]+'
+    MaxLength: 32
+
+  CostCenter:
+    Type: String
+    Description: Cost center code for billing allocation
+    AllowedPattern: '[A-Z0-9\-]+'
+
+  Owner:
+    Type: String
+    Description: Team or individual responsible for this stack (email)
+    AllowedPattern: '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+
+  VpcCidr:
+    Type: String
+    Default: 10.10.0.0/16
+    Description: CIDR block for the VPC
+    AllowedPattern: '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)\d{1,3}\.\d{1,3}/\d{1,2}$'
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.10.0.0/24
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.10.1.0/24
+
+  PublicSubnet3Cidr:
+    Type: String
+    Default: 10.10.2.0/24
+
+  PrivateAppSubnet1Cidr:
+    Type: String
+    Default: 10.10.10.0/24
+
+  PrivateAppSubnet2Cidr:
+    Type: String
+    Default: 10.10.11.0/24
+
+  PrivateAppSubnet3Cidr:
+    Type: String
+    Default: 10.10.12.0/24
+
+  PrivateDataSubnet1Cidr:
+    Type: String
+    Default: 10.10.20.0/24
+
+  PrivateDataSubnet2Cidr:
+    Type: String
+    Default: 10.10.21.0/24
+
+  PrivateDataSubnet3Cidr:
+    Type: String
+    Default: 10.10.22.0/24
+
+  FlowLogsRetentionDays:
+    Type: Number
+    Default: 365
+    AllowedValues: [30, 60, 90, 180, 365, 730, 2192]
+    Description: Number of days to retain VPC Flow Logs (HIPAA requires minimum 6 years for audit logs)
+
+  EnableFlowLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  IsFlowLogsEnabled: !Equals [!Ref EnableFlowLogs, 'true']
+
+Resources:
+  # ============================================================
+  # VPC
+  # ============================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: !If [IsProd, dedicated, default]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: DataClassification
+          Value: PHI-Restricted
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Compliance
+          Value: HIPAA-FedRAMP-HITECH
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # INTERNET GATEWAY
+  # ============================================================
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DeletionPolicy: Retain
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ============================================================
+  # PUBLIC SUBNETS
+  # ============================================================
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    DeletionPolicy: Retain
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-public-subnet-1'
+        - Key: SubnetType
+          Value: Public
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    DeletionPolicy: Retain
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-public-subnet-2'
+        - Key: SubnetType
+          Value: Public
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    DeletionPolicy: Retain
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet3Cidr
+      AvailabilityZone: !Select [2, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-public-subnet-3'
+        - Key: SubnetType
+          Value: Public
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  # ============================================================
+  # PRIVATE APPLICATION SUBNETS
+  # ============================================================
+  PrivateAppSubnet1:
+    Type: AWS::EC2::Subnet
+    DeletionPolicy: Retain
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateAppSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-app-subnet-1'
+        - Key: SubnetType
+          Value: PrivateApp
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  PrivateAppSubnet2:
+    Type: AWS::EC2::Subnet
+    DeletionPolicy: Retain
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateAppSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-app-subnet-2'
+        - Key: SubnetType
+          Value: PrivateApp
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  PrivateAppSubnet3:
+    Type: AWS::EC2::Subnet
+    DeletionPolicy: Retain
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateAppSubnet3Cidr
+      AvailabilityZone: !Select [2, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-app-subnet-3'
+        - Key: SubnetType
+          Value: PrivateApp
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  # ============================================================
+  # PRIVATE DATA SUBNETS (RDS, ElastiCache, etc.)
+  # ============================================================
+  PrivateDataSubnet1:
+    Type: AWS::EC2::Subnet
+    DeletionPolicy: Retain
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateDataSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-data-subnet-1'
+        - Key: SubnetType
+          Value: PrivateData
+
+  PrivateDataSubnet2:
+    Type: AWS::EC2::Subnet
+    DeletionPolicy: Retain
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateDataSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-data-subnet-2'
+        - Key: SubnetType
+          Value: PrivateData
+
+  PrivateDataSubnet3:
+    Type: AWS::EC2::Subnet
+    DeletionPolicy: Retain
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateDataSubnet3Cidr
+      AvailabilityZone: !Select [2, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-data-subnet-3'
+        - Key: SubnetType
+          Value: PrivateData
+
+  # ============================================================
+  # ELASTIC IPs FOR NAT GATEWAYS
+  # ============================================================
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-nat-eip-1'
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-nat-eip-2'
+
+  NatGateway3EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-nat-eip-3'
+
+  # ============================================================
+  # NAT GATEWAYS (one per AZ for HA)
+  # ============================================================
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-nat-gw-1'
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-nat-gw-2'
+
+  NatGateway3:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway3EIP.AllocationId
+      SubnetId: !Ref PublicSubnet3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-nat-gw-3'
+
+  # ============================================================
+  # ROUTE TABLES
+  # ============================================================
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet3
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateAppRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-app-rt-1'
+
+  PrivateAppRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateAppRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-app-rt-2'
+
+  PrivateAppRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateAppRouteTable3:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-app-rt-3'
+
+  PrivateAppRoute3:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTable3
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway3
+
+  PrivateAppSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet1
+      RouteTableId: !Ref PrivateAppRouteTable1
+
+  PrivateAppSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet2
+      RouteTableId: !Ref PrivateAppRouteTable2
+
+  PrivateAppSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet3
+      RouteTableId: !Ref PrivateAppRouteTable3
+
+  PrivateDataRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-data-rt'
+
+  PrivateDataSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnet1
+      RouteTableId: !Ref PrivateDataRouteTable
+
+  PrivateDataSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnet2
+      RouteTableId: !Ref PrivateDataRouteTable
+
+  PrivateDataSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnet3
+      RouteTableId: !Ref PrivateDataRouteTable
+
+  # ============================================================
+  # VPC ENDPOINTS (avoid data traversal over internet)
+  # ============================================================
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateAppRouteTable1
+        - !Ref PrivateAppRouteTable2
+        - !Ref PrivateAppRouteTable3
+        - !Ref PrivateDataRouteTable
+
+  DynamoDBVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateAppRouteTable1
+        - !Ref PrivateAppRouteTable2
+        - !Ref PrivateAppRouteTable3
+
+  SecretsManagerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnet1
+        - !Ref PrivateAppSubnet2
+        - !Ref PrivateAppSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  KMSVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.kms'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnet1
+        - !Ref PrivateAppSubnet2
+        - !Ref PrivateAppSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  ECRApiVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnet1
+        - !Ref PrivateAppSubnet2
+        - !Ref PrivateAppSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  ECRDkrVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnet1
+        - !Ref PrivateAppSubnet2
+        - !Ref PrivateAppSubnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # ============================================================
+  # SECURITY GROUPS
+  # ============================================================
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ApplicationName}-${Environment}-vpc-endpoint-sg'
+      GroupDescription: Security group for VPC Interface Endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: Allow HTTPS from within VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: Deny all outbound (endpoints are inbound-only)
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-vpc-endpoint-sg'
+
+  # ============================================================
+  # VPC FLOW LOGS
+  # ============================================================
+  FlowLogsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsFlowLogsEnabled
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${ApplicationName}-${Environment}'
+      RetentionInDays: !Ref FlowLogsRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-flow-logs'
+
+  FlowLogsRole:
+    Type: AWS::IAM::Role
+    Condition: IsFlowLogsEnabled
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-flow-logs-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: FlowLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt FlowLogsLogGroup.Arn
+
+  VPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: IsFlowLogsEnabled
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt FlowLogsRole.Arn
+      LogDestinationType: cloud-watch-logs
+      LogDestination: !GetAtt FlowLogsLogGroup.Arn
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      LogFormat: '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${windowstart} ${windowend} ${action} ${flowlogstatus} ${vpc-id} ${subnet-id} ${instance-id} ${tcp-flags} ${type} ${pkt-srcaddr} ${pkt-dstaddr} ${region} ${az-id} ${sublocation-type} ${sublocation-id} ${pkt-src-aws-service} ${pkt-dst-aws-service} ${flow-direction} ${traffic-path}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-flow-logs'
+
+  # ============================================================
+  # NETWORK ACLs (Defense in depth)
+  # ============================================================
+  PublicNetworkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-public-nacl'
+
+  PublicNaclInboundHTTPS:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 100
+      Protocol: 6
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 443
+        To: 443
+
+  PublicNaclInboundHTTP:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 110
+      Protocol: 6
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 80
+        To: 80
+
+  PublicNaclInboundEphemeral:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 120
+      Protocol: 6
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 1024
+        To: 65535
+
+  PublicNaclOutboundAll:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 0.0.0.0/0
+
+  PublicSubnet1NaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      NetworkAclId: !Ref PublicNetworkAcl
+
+  PublicSubnet2NaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      NetworkAclId: !Ref PublicNetworkAcl
+
+  PublicSubnet3NaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet3
+      NetworkAclId: !Ref PublicNetworkAcl
+
+  PrivateNetworkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-nacl'
+
+  PrivateNaclInboundVpc:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PrivateNetworkAcl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      CidrBlock: !Ref VpcCidr
+
+  PrivateNaclOutboundAll:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PrivateNetworkAcl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 0.0.0.0/0
+
+  PrivateAppSubnet1NaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet1
+      NetworkAclId: !Ref PrivateNetworkAcl
+
+  PrivateAppSubnet2NaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet2
+      NetworkAclId: !Ref PrivateNetworkAcl
+
+  PrivateAppSubnet3NaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet3
+      NetworkAclId: !Ref PrivateNetworkAcl
+
+  PrivateDataSubnet1NaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnet1
+      NetworkAclId: !Ref PrivateNetworkAcl
+
+  PrivateDataSubnet2NaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnet2
+      NetworkAclId: !Ref PrivateNetworkAcl
+
+  PrivateDataSubnet3NaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnet3
+      NetworkAclId: !Ref PrivateNetworkAcl
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  VpcCidr:
+    Description: VPC CIDR Block
+    Value: !Ref VpcCidr
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcCidr'
+
+  PublicSubnet1Id:
+    Description: Public Subnet 1 ID
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1Id'
+
+  PublicSubnet2Id:
+    Description: Public Subnet 2 ID
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2Id'
+
+  PublicSubnet3Id:
+    Description: Public Subnet 3 ID
+    Value: !Ref PublicSubnet3
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet3Id'
+
+  PublicSubnetIds:
+    Description: Comma-delimited list of public subnet IDs
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2, !Ref PublicSubnet3]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetIds'
+
+  PrivateAppSubnet1Id:
+    Description: Private App Subnet 1 ID
+    Value: !Ref PrivateAppSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateAppSubnet1Id'
+
+  PrivateAppSubnet2Id:
+    Description: Private App Subnet 2 ID
+    Value: !Ref PrivateAppSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateAppSubnet2Id'
+
+  PrivateAppSubnet3Id:
+    Description: Private App Subnet 3 ID
+    Value: !Ref PrivateAppSubnet3
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateAppSubnet3Id'
+
+  PrivateAppSubnetIds:
+    Description: Comma-delimited list of private app subnet IDs
+    Value: !Join [',', [!Ref PrivateAppSubnet1, !Ref PrivateAppSubnet2, !Ref PrivateAppSubnet3]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateAppSubnetIds'
+
+  PrivateDataSubnet1Id:
+    Description: Private Data Subnet 1 ID
+    Value: !Ref PrivateDataSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateDataSubnet1Id'
+
+  PrivateDataSubnet2Id:
+    Description: Private Data Subnet 2 ID
+    Value: !Ref PrivateDataSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateDataSubnet2Id'
+
+  PrivateDataSubnet3Id:
+    Description: Private Data Subnet 3 ID
+    Value: !Ref PrivateDataSubnet3
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateDataSubnet3Id'
+
+  PrivateDataSubnetIds:
+    Description: Comma-delimited list of private data subnet IDs
+    Value: !Join [',', [!Ref PrivateDataSubnet1, !Ref PrivateDataSubnet2, !Ref PrivateDataSubnet3]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateDataSubnetIds'
+
+  NatGateway1Id:
+    Description: NAT Gateway 1 ID
+    Value: !Ref NatGateway1
+    Export:
+      Name: !Sub '${AWS::StackName}-NatGateway1Id'
+
+  NatGateway2Id:
+    Description: NAT Gateway 2 ID
+    Value: !Ref NatGateway2
+    Export:
+      Name: !Sub '${AWS::StackName}-NatGateway2Id'
+
+  NatGateway3Id:
+    Description: NAT Gateway 3 ID
+    Value: !Ref NatGateway3
+    Export:
+      Name: !Sub '${AWS::StackName}-NatGateway3Id'
+
+  FlowLogsLogGroupArn:
+    Condition: IsFlowLogsEnabled
+    Description: VPC Flow Logs CloudWatch Log Group ARN
+    Value: !GetAtt FlowLogsLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FlowLogsLogGroupArn'
+
+  VPCEndpointSecurityGroupId:
+    Description: VPC Endpoint Security Group ID
+    Value: !Ref VPCEndpointSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCEndpointSGId'
