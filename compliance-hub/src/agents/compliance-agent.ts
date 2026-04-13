@@ -303,10 +303,3 @@ What area do you want to go deeper on?`;
 
 What are you trying to figure out?`;
 }
-- "What's the best tool for SOC 2?"
-- "How do I detect infrastructure drift?"
-- "What's the difference between OPA and Kyverno?"
-- "How do I achieve FedRAMP compliance?"
-
-What would you like to know?`;
-}
