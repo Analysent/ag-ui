@@ -1,0 +1,63 @@
+# 💼 AI Job Helper
+
+## What This Demo Shows
+
+This demo is inspired by [career-ops](https://github.com/santifer/career-ops) — an open-source AI-powered job search system. It showcases how AG-UI patterns combine to build a real-world productivity tool:
+
+1. **Shared State** (`useCoAgent`): The job pipeline is shared bidirectionally between the agent and the UI — the agent can move jobs through stages, and the UI can update state the agent reads
+2. **Tool-Based Generative UI** (`useCopilotAction` with `render`): When the agent evaluates a job, a rich evaluation card with dimension scores streams into the sidebar in real time
+3. **Human-in-the-Loop**: The agent recommends, but you stay in control — you approve stages and make final decisions
+
+## How to Interact
+
+**Evaluate a new job:**
+Paste any job description into the chat and the agent will:
+- Parse the company, role, location, and salary
+- Score it A–F across 5 weighted dimensions
+- Stream a live evaluation card into the sidebar
+- Add the job to your **Inbox**
+
+**Manage your pipeline:**
+- "Move Vercel to the interview stage"
+- "Reject the OpenAI listing"
+- "What's my highest-graded job right now?"
+
+**Manual control:**
+- Click any job card to expand a detail panel with dimension scores
+- Use the status dropdown on each card to move it through the pipeline
+- Click stage buttons in the detail panel for quick moves
+
+## Evaluation Dimensions
+
+The A–F grading system scores each job across 5 dimensions (1–10 scale):
+
+| Dimension | Weight | What it measures |
+|---|---|---|
+| **Role Fit** | 30% | Skills match, seniority alignment, day-to-day fit |
+| **Culture Match** | 20% | Mission alignment, team dynamics, values |
+| **Growth Potential** | 20% | Career trajectory, learning opportunities |
+| **Compensation** | 15% | Salary, equity, total comp vs. market |
+| **Work-Life Balance** | 15% | Remote flexibility, hours, sustainability |
+
+| Grade | Score | Meaning |
+|---|---|---|
+| **A** | 8.0–10 | Excellent — prioritize and apply |
+| **B** | 6.0–7.9 | Good — worth pursuing |
+| **C** | 4.0–5.9 | Moderate — consider carefully |
+| **D** | 2.0–3.9 | Poor match — likely skip |
+| **F** | 0–1.9 | Not a fit — don't apply |
+
+## AG-UI Patterns in Action
+
+**`useCoAgent` — Shared State:**
+- Both the agent and the UI read from and write to the same `jobs` array
+- When you drag a job to a new stage in the UI, the agent immediately sees the updated pipeline
+- When the agent moves a job via `update_job_status`, the UI re-renders instantly — no polling, no refresh
+
+**`useCopilotAction` with `render` — Tool-Based Generative UI:**
+- The agent calls `evaluate_job` with structured parameters
+- The `render` callback streams the evaluation card character-by-character into the chat sidebar
+- Score bars animate as values stream in during `inProgress` status
+- The `handler` runs after streaming completes, persisting the job to shared state
+
+This pattern — where the sidebar shows live AI-generated UI while the main canvas manages persistent state — is a powerful foundation for any AI-augmented productivity tool.

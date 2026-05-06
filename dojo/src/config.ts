@@ -60,6 +60,13 @@ const config: DemoConfig[] = [
       "Use collaboration to edit a document in real time with your Copilot",
     tags: ["State", "Streaming", "Tools"],
   }),
+  createDemoConfig({
+    id: "job_helper",
+    name: "AI Job Helper",
+    description:
+      "Evaluate job listings with A-F grades and manage your application pipeline with AI",
+    tags: ["Shared State", "Generative UI", "Tools", "HITL"],
+  }),
 ];
 
 export default config;
